@@ -25,17 +25,41 @@
 
 static uint64_t il2cpp_base = 0;
 
+// HTProtect strips il2cpp exports from libil2cpp's symbol table, so xdl_sym
+// (direct ELF export parse) fails for every function. The game's own loader
+// (libunity) resolves the C API at runtime via dlsym, and HTProtect's resolver
+// hook serves the real addresses to in-process callers. So try real dlsym paths
+// first and only fall back to xdl_sym. Counters report which path won.
+static int g_resolved_dlsym = 0, g_resolved_default = 0, g_resolved_xdl = 0, g_resolved_fail = 0;
+
+static void *resolve_api(void *dl_handle, void *xdl_handle, const char *name) {
+    void *p = nullptr;
+    if (dl_handle) p = dlsym(dl_handle, name);
+    if (p) { g_resolved_dlsym++; return p; }
+    p = dlsym(RTLD_DEFAULT, name);
+    if (p) { g_resolved_default++; return p; }
+    p = xdl_sym(xdl_handle, name, nullptr);
+    if (p) { g_resolved_xdl++; return p; }
+    g_resolved_fail++;
+    return nullptr;
+}
+
 void init_il2cpp_api(void *handle) {
-#define DO_API(r, n, p) {                      \
-    n = (r (*) p)xdl_sym(handle, #n, nullptr); \
-    if(!n) {                                   \
-        LOGW("api not found %s", #n);          \
-    }                                          \
+    // handle is the xdl handle; also get a real dlopen handle for dlsym.
+    void *dl_handle = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!dl_handle) dl_handle = dlopen("libil2cpp.so", RTLD_NOW);
+    LOGI("resolver: xdl_handle=%p dl_handle=%p", handle, dl_handle);
+#define DO_API(r, n, p) {                               \
+    n = (r (*) p)resolve_api(dl_handle, handle, #n);    \
 }
 
 #include "il2cpp-api-functions.h"
 
 #undef DO_API
+    LOGI("API resolve summary: dlsym=%d default=%d xdl=%d FAIL=%d",
+         g_resolved_dlsym, g_resolved_default, g_resolved_xdl, g_resolved_fail);
+    LOGI("il2cpp_init=%p il2cpp_domain_get=%p il2cpp_domain_get_assemblies=%p",
+         (void*)il2cpp_init, (void*)il2cpp_domain_get, (void*)il2cpp_domain_get_assemblies);
 }
 
 std::string get_method_modifier(uint32_t flags) {
@@ -335,11 +359,18 @@ void il2cpp_api_init(void *handle) {
         LOGE("Failed to initialize il2cpp api.");
         return;
     }
-    while (!il2cpp_is_vm_thread(nullptr)) {
-        LOGI("Waiting for il2cpp_init...");
+    // Original code spun on il2cpp_is_vm_thread(nullptr), which never turns true
+    // on our injected (non-VM) thread, hanging forever. Instead wait for the VM
+    // domain to exist, then attach OUR thread to it so API calls are legal.
+    Il2CppDomain *domain = nullptr;
+    for (int i = 0; i < 120; i++) {
+        if (il2cpp_domain_get) domain = il2cpp_domain_get();
+        if (domain) break;
+        LOGI("Waiting for il2cpp domain... (%d)", i);
         sleep(1);
     }
-    auto domain = il2cpp_domain_get();
+    if (!domain) { LOGE("il2cpp domain never appeared"); return; }
+    LOGI("il2cpp domain: %p, attaching dump thread", (void *) domain);
     il2cpp_thread_attach(domain);
 }
 
